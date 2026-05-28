@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@earendil-works/pi-coding-agent": [
+        "/Users/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-coding-agent"
+      ],
+      "@earendil-works/pi-coding-agent/*": [
+        "/Users/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-coding-agent/*"
+      ],
+      "@earendil-works/pi-tui": [
+        "/Users/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-tui"
+      ],
+      "@earendil-works/pi-ai": [
+        "/Users/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-ai"
+      ],
+      "typebox": [
+        "/Users/kristofferremback/.bun/install/global/node_modules/typebox"
+      ]
+    }
+  },
+  "include": ["*.ts", "**/*.ts"],
+  "exclude": ["node_modules"]
+}
