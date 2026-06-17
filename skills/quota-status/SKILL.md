@@ -27,7 +27,7 @@ bun run /Users/kristofferremback/dev/personal/pi-extensions/skills/quota-status/
 
 ## What to report
 
-Print the script's stdout directly. If the script exits with an error, explain the issue and suggest:
+Print the script's stdout directly. The skill intentionally uses a detailed multi-line format; the compact Pi status-line plugin output is unchanged. If the script exits with an error, explain the issue and suggest:
 
 - For **OpenAI**: check that `~/.pi/agent/auth.json` or `~/.codex/auth.json` has a valid token.
 - For **OpenCode**: run `/quota-status cookie set <cookie-value>` to refresh the cookie.
@@ -37,6 +37,21 @@ Print the script's stdout directly. If the script exits with an error, explain t
 User: "What's my remaining quota?"
 
 Response:
+```text
+Quota for opencode-go
+Checked: 2026-06-17, 19:20:00 (2026-06-17T17:20:00.000Z)
+Windows: 3
+
+- Rolling
+  Remaining: 66.0%
+  Used:      34.0%
+  Meter:     [████████████████░░░░░░░░]
+  Reset:     2026-06-17, 23:02:00 (in 3h 42m; 2026-06-17T21:02:00.000Z)
+
+- Weekly
+  Remaining: 62.0%
+  Used:      38.0%
+  Meter:     [███████████████░░░░░░░░░]
+  Reset:     2026-06-23, 09:00:00 (in 5d 13h 40m; 2026-06-23T07:00:00.000Z)
 ```
-Rolling [███████░░] 78% left | Weekly [████████░░] 82% left | Monthly [████░░░░░░] 35% left (resets tomorrow 08:00)
-```
+
