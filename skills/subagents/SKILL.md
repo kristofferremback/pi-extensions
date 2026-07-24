@@ -11,7 +11,7 @@ Each child is headless, has its own context window, cannot see the parent conver
 
 Choose the harness deliberately:
 
-- `pi` — default when no harness is requested. Only `openai-codex/*` and `opencode-go/*` models are permitted. With no model or effort, it inherits the parent model and thinking level.
+- `pi` — default when no harness is requested. `openai-codex/*`, `opencode-go/*`, and `alibaba-cloud/*` models are permitted. With no model or effort, it inherits the parent model and thinking level.
 - `claude` — Claude Agent SDK using the locally authenticated Claude Code installation and the user's Claude subscription. Never route Claude through Pi.
 - `codex` — Codex CLI/app-server using the user's Codex authentication. Use for OpenAI models when an independent Codex harness is useful.
 
@@ -24,7 +24,8 @@ Choose the harness deliberately:
 - `opencode-go/kimi-k2.7-code`
 - `opencode-go/deepseek-v4-flash`
 - `opencode-go/glm-5.2`
-- Other currently registered `opencode-go/*` models when their strengths fit the task
+- `alibaba-cloud/qwen3.8-max-preview`
+- Other currently registered models from the permitted providers when their strengths fit the task
 
 ### Claude
 

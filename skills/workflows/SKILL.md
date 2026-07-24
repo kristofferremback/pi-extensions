@@ -45,11 +45,11 @@ export const meta = {
 }
 ```
 
-- `pi`: only `openai-codex/*` and `opencode-go/*`; inherits the parent model and effort by default.
+- `pi`: supports `openai-codex/*`, `opencode-go/*`, and `alibaba-cloud/*`; inherits the parent model and effort by default.
 - `claude`: Claude Agent SDK using the locally authenticated Claude subscription. Use native aliases such as `fable`, `opus`, or `sonnet`; prefer `fable` and `high` unless requested otherwise.
 - `codex`: Codex CLI/app-server using Codex authentication. Prefer `gpt-5.6-sol` and `high` unless requested otherwise.
 
-For Pi, prefer a full model string such as `model: "opencode-go/kimi-k3"`. `provider` plus a bare model is also accepted.
+For Pi, prefer a full model string such as `model: "alibaba-cloud/qwen3.8-max-preview"`. `provider` plus a bare model is also accepted.
 
 ## Reliability rules
 

@@ -28,6 +28,10 @@ import {
 import type { Cause, Scope } from "effect";
 import { Effect, Queue, Stream } from "effect";
 import { modelRuntimeFromRegistry } from "../../../shared/model-runtime.ts";
+import {
+  ALLOWED_PI_CHILD_PROVIDERS_LABEL,
+  isAllowedPiChildProvider,
+} from "../../../shared/pi-child-provider.ts";
 import { usageFromMessages } from "../../../shared/usage.ts";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
 import type {
@@ -66,13 +70,11 @@ type ThinkingLevel = NonNullable<
  * then must be unambiguous across providers. No hint inherits the parent
  * model; with nothing to inherit, the SDK default applies.
  */
-const ALLOWED_PI_CHILD_PROVIDERS = new Set(["openai-codex", "opencode-go"]);
-
 function requireAllowedPiModel(model: Model<any> | undefined) {
   if (!model) return undefined;
-  if (!ALLOWED_PI_CHILD_PROVIDERS.has(model.provider)) {
+  if (!isAllowedPiChildProvider(model.provider)) {
     throw new Error(
-      `Pi subagents only allow openai-codex and opencode-go models; received "${model.provider}/${model.id}". Use the claude or codex harness instead.`,
+      `Pi subagents only allow ${ALLOWED_PI_CHILD_PROVIDERS_LABEL} models; received "${model.provider}/${model.id}". Use the claude or codex harness instead.`,
     );
   }
   return model;
@@ -103,7 +105,7 @@ function resolvePiModel(
   }
   const matches = registry
     .getAll()
-    .filter((m) => m.id === hint && ALLOWED_PI_CHILD_PROVIDERS.has(m.provider));
+    .filter((m) => m.id === hint && isAllowedPiChildProvider(m.provider));
   if (matches.length === 1) return matches[0];
   if (matches.length > 1) {
     throw new Error(
@@ -111,7 +113,7 @@ function resolvePiModel(
     );
   }
   throw new Error(
-    `Unknown or disallowed Pi model "${hint}". Use an openai-codex or opencode-go model.`,
+    `Unknown or disallowed Pi model "${hint}". Use a model from ${ALLOWED_PI_CHILD_PROVIDERS_LABEL}.`,
   );
 }
 

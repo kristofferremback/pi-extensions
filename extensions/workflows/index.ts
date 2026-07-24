@@ -26,6 +26,10 @@ import * as fs from "node:fs";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import * as path from "node:path";
 import {
+  ALLOWED_PI_CHILD_PROVIDERS_LABEL,
+  isAllowedPiChildProvider,
+} from "../shared/pi-child-provider.ts";
+import {
   DEFAULT_MAX_LINES,
   getAgentDir,
   getMarkdownTheme,
@@ -156,7 +160,6 @@ function errorText(error: unknown): string {
 }
 
 const WORKFLOW_HARNESSES = new Set<BackendName>(["pi", "claude", "codex"]);
-const ALLOWED_PI_WORKFLOW_PROVIDERS = new Set(["openai-codex", "opencode-go"]);
 
 function workflowTranscript(items: ReadonlyArray<TranscriptItem>) {
   const transcript: TranscriptEntry[] = [];
@@ -997,7 +1000,7 @@ export default function workflows(pi: ExtensionAPI) {
                   .find(
                     (candidate) =>
                       candidate.id === modelOpt &&
-                      ALLOWED_PI_WORKFLOW_PROVIDERS.has(candidate.provider),
+                      isAllowedPiChildProvider(candidate.provider),
                   );
               }
               if (!resolved) {
@@ -1010,9 +1013,9 @@ export default function workflows(pi: ExtensionAPI) {
               }
               model = resolved;
             }
-            if (model && !ALLOWED_PI_WORKFLOW_PROVIDERS.has(model.provider)) {
+            if (model && !isAllowedPiChildProvider(model.provider)) {
               return fail(
-                `agent "${label}": Pi workflows only allow openai-codex and opencode-go models; received "${model.provider}/${model.id}"`,
+                `agent "${label}": Pi workflows only allow ${ALLOWED_PI_CHILD_PROVIDERS_LABEL} models; received "${model.provider}/${model.id}"`,
               );
             }
             record.model = model?.id;
