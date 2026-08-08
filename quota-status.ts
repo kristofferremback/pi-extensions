@@ -53,8 +53,13 @@ let quotaWindows: QuotaWindow[] = [];
 let refreshInFlight: Promise<void> | undefined;
 
 const updateWidget = (ctx: ExtensionContext): void => {
-	ctx.ui.setWidget(WIDGET_KEY, undefined);
-	setAboveInputPart(ctx, "right", renderQuota(quotaWindows));
+	try {
+		ctx.ui.setWidget(WIDGET_KEY, undefined);
+		setAboveInputPart(ctx, "right", renderQuota(quotaWindows));
+	} catch {
+		// A delayed refresh may finish after a child session or reload has made
+		// its extension context stale. UI cleanup is best-effort in that case.
+	}
 };
 
 const refreshQuota = async (ctx: ExtensionContext): Promise<void> => {
@@ -79,6 +84,7 @@ const debouncedRefresh = (() => {
 	let pendingCtx: ExtensionContext | undefined;
 
 	return (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) return;
 		pendingCtx = ctx;
 		if (timer) return;
 		timer = setTimeout(async () => {
