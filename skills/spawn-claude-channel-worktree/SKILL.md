@@ -5,6 +5,12 @@ description: Spin up a new Threa worktree with a Claude Code channel agent in a 
 
 # Spawn Claude Code channel worktree
 
+> Resolve `PI_EXTENSIONS_ROOT` from this skill file before running commands:
+
+```bash
+PI_EXTENSIONS_ROOT="$(cd "<skill-directory>/../.." && pwd)"
+```
+
 A sibling to `spawn-pi-remote-worktree`, but for Claude Code channels.
 
 It automates the fiddly flow for the Threa `extensions/claude-code-remote/`
@@ -59,14 +65,14 @@ Resolve relative paths against this skill directory (the parent of this file),
 then run the script:
 
 ```bash
-bash /Users/kristofferremback/dev/personal/pi-extensions/skills/spawn-claude-channel-worktree/spawn.sh \
+bash $PI_EXTENSIONS_ROOT/skills/spawn-claude-channel-worktree/spawn.sh \
   <name> [options]
 ```
 
 Example:
 
 ```bash
-bash /Users/kristofferremback/dev/personal/pi-extensions/skills/spawn-claude-channel-worktree/spawn.sh \
+bash $PI_EXTENSIONS_ROOT/skills/spawn-claude-channel-worktree/spawn.sh \
   explore-claude-agent --branch explore/claude-agent
 ```
 

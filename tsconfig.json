@@ -5,22 +5,21 @@
     "moduleResolution": "bundler",
     "strict": true,
     "skipLibCheck": true,
-    "baseUrl": ".",
     "paths": {
       "@earendil-works/pi-coding-agent": [
-        "/Users/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-coding-agent"
+        "/home/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-coding-agent"
       ],
       "@earendil-works/pi-coding-agent/*": [
-        "/Users/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-coding-agent/*"
+        "/home/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-coding-agent/*"
       ],
       "@earendil-works/pi-tui": [
-        "/Users/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-tui"
+        "/home/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-tui"
       ],
       "@earendil-works/pi-ai": [
-        "/Users/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-ai"
+        "/home/kristofferremback/.bun/install/global/node_modules/@earendil-works/pi-ai"
       ],
       "typebox": [
-        "/Users/kristofferremback/.bun/install/global/node_modules/typebox"
+        "/home/kristofferremback/.bun/install/global/node_modules/typebox"
       ]
     }
   },
