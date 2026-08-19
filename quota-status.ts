@@ -51,21 +51,24 @@ const setAboveInputPart = (ctx: ExtensionContext, part: "left" | "right", text: 
 let activeProvider: string | undefined;
 let quotaWindows: QuotaWindow[] = [];
 let refreshInFlight: Promise<void> | undefined;
+let contextEpoch = 0;
 
 const updateWidget = (ctx: ExtensionContext): void => {
 	ctx.ui.setWidget(WIDGET_KEY, undefined);
 	setAboveInputPart(ctx, "right", renderQuota(quotaWindows));
 };
 
-const refreshQuota = async (ctx: ExtensionContext): Promise<void> => {
+const refreshQuota = async (ctx: ExtensionContext, epoch: number): Promise<void> => {
 	activeProvider = ctx.model?.provider;
 	if (!isSupportedProvider(activeProvider)) {
+		if (epoch !== contextEpoch) return;
 		quotaWindows = [];
 		updateWidget(ctx);
 		return;
 	}
 
 	const result = await getQuotaForProvider(activeProvider);
+	if (epoch !== contextEpoch) return;
 	if (result.ok) {
 		quotaWindows = result.windows;
 	} else {
@@ -81,15 +84,17 @@ const debouncedRefresh = (() => {
 	return (ctx: ExtensionContext) => {
 		pendingCtx = ctx;
 		if (timer) return;
+		const epoch = contextEpoch;
 		timer = setTimeout(async () => {
 			timer = undefined;
 			const c = pendingCtx!;
 			pendingCtx = undefined;
-			if (refreshInFlight) return;
+			if (epoch !== contextEpoch || refreshInFlight) return;
 			refreshInFlight = (async () => {
 				try {
-					await refreshQuota(c);
+					await refreshQuota(c, epoch);
 				} catch {
+					if (epoch !== contextEpoch) return;
 					quotaWindows = [];
 					updateWidget(c);
 				} finally {
@@ -102,6 +107,7 @@ const debouncedRefresh = (() => {
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
+		contextEpoch += 1;
 		debouncedRefresh(ctx);
 	});
 
@@ -118,6 +124,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		contextEpoch += 1;
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		setAboveInputPart(ctx, "right", undefined);
 	});

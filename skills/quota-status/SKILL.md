@@ -5,6 +5,12 @@ description: Reports the current API quota/usage for the active AI provider (Ope
 
 # Quota Status
 
+> Resolve `PI_EXTENSIONS_ROOT` from this skill file before running commands:
+
+```bash
+PI_EXTENSIONS_ROOT="$(cd "<skill-directory>/../.." && pwd)"
+```
+
 Reports the current API quota/usage for the active AI provider.
 
 ## Supported providers
@@ -18,11 +24,11 @@ Run the report script. It uses `defaultProvider` from `~/.pi/agent/settings.json
 
 ```bash
 # Use the default provider
-bun run /Users/kristofferremback/dev/personal/pi-extensions/skills/quota-status/report.ts
+bun run $PI_EXTENSIONS_ROOT/skills/quota-status/report.ts
 
 # Or specify a provider
-bun run /Users/kristofferremback/dev/personal/pi-extensions/skills/quota-status/report.ts openai-codex
-bun run /Users/kristofferremback/dev/personal/pi-extensions/skills/quota-status/report.ts opencode-go
+bun run $PI_EXTENSIONS_ROOT/skills/quota-status/report.ts openai-codex
+bun run $PI_EXTENSIONS_ROOT/skills/quota-status/report.ts opencode-go
 ```
 
 ## What to report

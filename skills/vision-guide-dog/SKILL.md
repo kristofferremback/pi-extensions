@@ -5,6 +5,12 @@ description: Offload vision to a persistent vision-capable sub-agent (a "guide d
 
 # Vision Guide Dog
 
+> Resolve `PI_EXTENSIONS_ROOT` from this skill file before running commands:
+
+```bash
+PI_EXTENSIONS_ROOT="$(cd "<skill-directory>/../.." && pwd)"
+```
+
 You (the active Pi agent) have no vision. This skill gives you a persistent
 "guide dog": a **second Pi session** running a **vision-capable model**, pinned
 to a **session file** so it remembers prior images and questions. You drive it
@@ -51,14 +57,14 @@ pi -p --no-tools --no-extensions \
 Resolve relative paths against this skill directory (the parent of this file).
 
 ```bash
-SKILL_DIR="$(dirname "$(readlink -f /Users/kristofferremback/dev/personal/pi-extensions/skills/vision-guide-dog/SKILL.md 2>/dev/null || echo /Users/kristofferremback/dev/personal/pi-extensions/skills/vision-guide-dog/SKILL.md)")"
+SKILL_DIR="$(dirname "$(readlink -f $PI_EXTENSIONS_ROOT/skills/vision-guide-dog/SKILL.md 2>/dev/null || echo $PI_EXTENSIONS_ROOT/skills/vision-guide-dog/SKILL.md)")"
 bash "$SKILL_DIR/vision-dog.sh" [options] [IMAGE] [QUESTION]
 ```
 
 Or directly (path is stable):
 
 ```bash
-bash /Users/kristofferremback/dev/personal/pi-extensions/skills/vision-guide-dog/vision-dog.sh [options] [IMAGE] [QUESTION]
+bash $PI_EXTENSIONS_ROOT/skills/vision-guide-dog/vision-dog.sh [options] [IMAGE] [QUESTION]
 ```
 
 ### Arguments
@@ -103,7 +109,7 @@ hard OCR, diagrams, or fine detail. Override per call with `--model`, or set
 ### 1. Describe a new image
 
 ```bash
-bash /Users/kristofferremback/dev/personal/pi-extensions/skills/vision-guide-dog/vision-dog.sh \
+bash $PI_EXTENSIONS_ROOT/skills/vision-guide-dog/vision-dog.sh \
   /path/to/image.png "What is in this image?"
 ```
 
@@ -112,21 +118,21 @@ bash /Users/kristofferremback/dev/personal/pi-extensions/skills/vision-guide-dog
 The dog remembers the last image because the session file persists:
 
 ```bash
-bash /Users/kristofferremback/dev/personal/pi-extensions/skills/vision-guide-dog/vision-dog.sh \
+bash $PI_EXTENSIONS_ROOT/skills/vision-guide-dog/vision-dog.sh \
   "What color was the child's cap, and was there any text on it?"
 ```
 
 ### 3. Switch topic / new image, fresh memory
 
 ```bash
-bash /Users/kristofferremback/dev/personal/pi-extensions/skills/vision-guide-dog/vision-dog.sh \
+bash $PI_EXTENSIONS_ROOT/skills/vision-guide-dog/vision-dog.sh \
   --new /path/to/other.png "Describe this one."
 ```
 
 ### 4. Separate conversation threads via separate session files
 
 ```bash
-bash /Users/kristofferremback/dev/personal/pi-extensions/skills/vision-guide-dog/vision-dog.sh \
+bash $PI_EXTENSIONS_ROOT/skills/vision-guide-dog/vision-dog.sh \
   --session ~/.pi/agent/sessions/vision-guide-dog/ui-review.jsonl \
   screenshot.png "Does this dialog have a cancel button?"
 ```
