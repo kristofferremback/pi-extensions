@@ -260,7 +260,7 @@ export const fetchQuotaFromOpenCodeWeb = async (): Promise<
 	const html = await response.text();
 
 	const scriptMatch = html.match(
-		/rollingUsage:\$R\[\d+\]=\{status:"ok",resetInSec:(\d+),usagePercent:(\d+)\},weeklyUsage:\$R\[\d+\]=\{status:"ok",resetInSec:(\d+),usagePercent:(\d+)\},monthlyUsage:\$R\[\d+\]=\{status:"ok",resetInSec:(\d+),usagePercent:(\d+)\}/,
+		/rollingUsage:\$R\[\d+\]=\{status:"[^"]*",resetInSec:(\d+),usagePercent:(\d+)\},weeklyUsage:\$R\[\d+\]=\{status:"[^"]*",resetInSec:(\d+),usagePercent:(\d+)\},monthlyUsage:\$R\[\d+\]=\{status:"[^"]*",resetInSec:(\d+),usagePercent:(\d+)\}/,
 	);
 	if (!scriptMatch) return "parse-failed";
 
