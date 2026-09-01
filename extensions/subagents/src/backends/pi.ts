@@ -661,7 +661,12 @@ const makePiSession = (
 
 export const piBackend: SubagentBackend = {
   name: "pi",
-  capabilities: { steering: true, modelSelection: true, reasoningEffort: true },
+  capabilities: {
+    steering: true,
+    modelSelection: true,
+    reasoningEffort: true,
+    resumeFromSessionId: false,
+  },
   // In-process SDK: always available.
   available: Effect.succeed(true),
   spawn: makePiSession,

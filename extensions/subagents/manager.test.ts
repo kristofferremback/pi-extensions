@@ -43,6 +43,20 @@ const TestRegistryLive = Layer.sync(BackendRegistry, () => {
   );
 });
 
+const createRuntimeWithBackends = (backends: SubagentBackend[]) =>
+  ManagedRuntime.make(
+    SubagentManagerLive.pipe(
+      Layer.provide(
+        Layer.succeed(
+          BackendRegistry,
+          new Map<BackendName, SubagentBackend>(
+            backends.map((backend) => [backend.name, backend]),
+          ),
+        ),
+      ),
+    ),
+  );
+
 const createTestRuntime = () =>
   ManagedRuntime.make(
     SubagentManagerLive.pipe(Layer.provide(TestRegistryLive)),
@@ -332,4 +346,472 @@ test("send steers an idle subagent into another turn", async () => {
     assert.equal(afterSecond?.status, "done");
     assert.match(afterSecond?.finalText ?? "", /Second turn/);
   });
+});
+
+test("a recoverable backend hibernates after settle and resumes by native session id", async () => {
+  const billingUsage = {
+    input: 100,
+    output: 20,
+    cacheRead: 10,
+    cacheWrite: 5,
+    totalTokens: 135,
+    cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2, total: 3.3 },
+  };
+  const base = makeStubBackend({
+    backend: "claude",
+    defaultModelLabel: "claude/sonnet",
+    contextWindow: 200_000,
+    toolName: "Bash",
+    cadenceMs: 1,
+    billingUsage,
+  });
+  const resumedIds: Array<string | undefined> = [];
+  const priorBilling: Array<typeof billingUsage | undefined> = [];
+  const closedAtSpawn: number[] = [];
+  let closedSessions = 0;
+  let firstCloseStarted = false;
+  let releaseFirstClose = () => {};
+  const firstCloseGate = new Promise<void>((resolve) => {
+    releaseFirstClose = resolve;
+  });
+  const backend: SubagentBackend = {
+    ...base,
+    capabilities: { ...base.capabilities, resumeFromSessionId: true },
+    spawn: (spawnTask) =>
+      Effect.gen(function* () {
+        resumedIds.push(spawnTask.resumeNativeSessionId);
+        priorBilling.push(spawnTask.priorBillingUsage);
+        closedAtSpawn.push(closedSessions);
+        const session = yield* base.spawn(spawnTask);
+        return {
+          ...session,
+          shutdown: Effect.promise(async () => {
+            if (closedSessions === 0) {
+              firstCloseStarted = true;
+              await firstCloseGate;
+            }
+            closedSessions++;
+            return true;
+          }),
+        };
+      }),
+  };
+
+  const runtime = createRuntimeWithBackends([backend]);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("First turn")),
+    );
+    await runTool(runtime, manager.waitFor([snap.id]));
+    const nativeSessionId = manager.view.get(snap.id)?.meta.nativeSessionId;
+    assert.ok(nativeSessionId);
+
+    assert.equal(manager.view.get(snap.id)?.status, "done");
+
+    // Resume immediately. The manager must still await the detached scope
+    // shutdown before a new process reads the same native transcript.
+    const resumed = runTool(runtime, manager.send(snap.id, "Second turn"));
+    while (!firstCloseStarted) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(resumedIds, [undefined]);
+    releaseFirstClose();
+    await resumed;
+    while (manager.view.get(snap.id)?.status !== "running") {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await runTool(runtime, manager.waitFor([snap.id]));
+    while (closedSessions < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.deepEqual(resumedIds, [undefined, nativeSessionId]);
+    assert.deepEqual(priorBilling, [undefined, billingUsage]);
+    assert.deepEqual(closedAtSpawn, [0, 1]);
+    assert.equal(
+      manager.view.get(snap.id)?.meta.nativeSessionId,
+      nativeSessionId,
+    );
+    assert.match(manager.view.get(snap.id)?.finalText ?? "", /Second turn/);
+  } finally {
+    releaseFirstClose();
+    await runtime.dispose();
+  }
+});
+
+test("cancel interrupts a restart waiting for native shutdown", async () => {
+  const base = makeStubBackend({
+    backend: "claude",
+    defaultModelLabel: "claude/sonnet",
+    contextWindow: 200_000,
+    toolName: "Bash",
+    cadenceMs: 1,
+  });
+  let spawnCount = 0;
+  let shutdownStarted = false;
+  let releaseShutdown = () => {};
+  const shutdownGate = new Promise<void>((resolve) => {
+    releaseShutdown = resolve;
+  });
+  const backend: SubagentBackend = {
+    ...base,
+    capabilities: { ...base.capabilities, resumeFromSessionId: true },
+    spawn: (spawnTask) =>
+      Effect.gen(function* () {
+        spawnCount++;
+        const session = yield* base.spawn(spawnTask);
+        if (spawnCount !== 1) return session;
+        return {
+          ...session,
+          shutdown: Effect.gen(function* () {
+            shutdownStarted = true;
+            yield* Effect.promise(() => shutdownGate);
+            return yield* session.shutdown!;
+          }),
+        };
+      }),
+  };
+
+  const runtime = createRuntimeWithBackends([backend]);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("First turn")),
+    );
+    await runTool(runtime, manager.waitFor([snap.id]));
+    while (!shutdownStarted) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const sendOutcome = runTool(
+      runtime,
+      manager.send(snap.id, "Must be cancelled"),
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const report = await runTool(runtime, manager.cancel([snap.id]));
+    assert.equal(report[0]?.cancelled, true);
+    assert.equal(manager.view.get(snap.id)?.status, "error");
+    assert.equal(manager.view.get(snap.id)?.errorText, "Run was aborted");
+    assert.ok(await sendOutcome);
+    assert.equal(spawnCount, 1);
+  } finally {
+    releaseShutdown();
+    await runtime.dispose();
+  }
+});
+
+test("an unconfirmed native shutdown refuses to resume the session", async () => {
+  const base = makeStubBackend({
+    backend: "claude",
+    defaultModelLabel: "claude/sonnet",
+    contextWindow: 200_000,
+    toolName: "Bash",
+    cadenceMs: 1,
+  });
+  let spawnCount = 0;
+  let shutdownStarted = false;
+  let releaseShutdown = () => {};
+  const shutdownGate = new Promise<void>((resolve) => {
+    releaseShutdown = resolve;
+  });
+  const backend: SubagentBackend = {
+    ...base,
+    capabilities: { ...base.capabilities, resumeFromSessionId: true },
+    spawn: (spawnTask) =>
+      Effect.gen(function* () {
+        spawnCount++;
+        const session = yield* base.spawn(spawnTask);
+        return spawnCount === 1
+          ? {
+              ...session,
+              shutdown: Effect.gen(function* () {
+                shutdownStarted = true;
+                yield* Effect.promise(() => shutdownGate);
+                return false;
+              }),
+            }
+          : session;
+      }),
+  };
+
+  const runtime = createRuntimeWithBackends([backend]);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("First turn")),
+    );
+    await runTool(runtime, manager.waitFor([snap.id]));
+    while (!shutdownStarted) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const refused = runTool(runtime, manager.send(snap.id, "Must not run"));
+    const waiting = runTool(runtime, manager.waitFor([snap.id]));
+    releaseShutdown();
+    await assert.rejects(refused, /did not shut down cleanly/);
+    await Promise.race([
+      waiting,
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("waitFor stayed stuck")), 1_000),
+      ),
+    ]);
+    await assert.rejects(
+      runTool(runtime, manager.send(snap.id, "Must still not run")),
+      /did not shut down cleanly/,
+    );
+    assert.equal(spawnCount, 1);
+    assert.equal(manager.view.get(snap.id)?.status, "done");
+  } finally {
+    releaseShutdown();
+    await runtime.dispose();
+  }
+});
+
+test("dispose interrupts an in-flight native session resume", async () => {
+  const base = makeStubBackend({
+    backend: "claude",
+    defaultModelLabel: "claude/sonnet",
+    contextWindow: 200_000,
+    toolName: "Bash",
+    cadenceMs: 1,
+  });
+  let spawnCount = 0;
+  let resumeSpawnStarted = false;
+  let releaseResumeSpawn = () => {};
+  const resumeSpawnGate = new Promise<void>((resolve) => {
+    releaseResumeSpawn = resolve;
+  });
+  const backend: SubagentBackend = {
+    ...base,
+    capabilities: { ...base.capabilities, resumeFromSessionId: true },
+    spawn: (spawnTask) =>
+      Effect.gen(function* () {
+        spawnCount++;
+        if (spawnCount === 2) {
+          resumeSpawnStarted = true;
+          yield* Effect.promise(() => resumeSpawnGate);
+        }
+        return yield* base.spawn(spawnTask);
+      }),
+  };
+
+  const runtime = createRuntimeWithBackends([backend]);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("First turn")),
+    );
+    await runTool(runtime, manager.waitFor([snap.id]));
+
+    const resumeOutcome = runTool(
+      runtime,
+      manager.send(snap.id, "Must not run"),
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    while (!resumeSpawnStarted) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    await runTool(runtime, manager.disposeAll);
+    assert.equal(manager.view.size(), 0);
+    assert.ok(await resumeOutcome);
+    assert.equal(spawnCount, 2);
+  } finally {
+    releaseResumeSpawn();
+    await runtime.dispose();
+  }
+});
+
+test("cancel stops a queued native turn waiting to emit RunStarted", async () => {
+  let firstNativeSettled = false;
+  let secondTurnWaiting = false;
+  let releaseFirstSettle = () => {};
+  let releaseSecondTurn = () => {};
+  const firstSettleGate = new Promise<void>((resolve) => {
+    releaseFirstSettle = resolve;
+  });
+  const secondTurnGate = new Promise<void>((resolve) => {
+    releaseSecondTurn = resolve;
+  });
+  let settleCount = 0;
+  const base = makeStubBackend({
+    backend: "claude",
+    defaultModelLabel: "claude/sonnet",
+    contextWindow: 200_000,
+    toolName: "Bash",
+    cadenceMs: 1,
+    beforeTurn: async (turn) => {
+      if (turn === 1) {
+        secondTurnWaiting = true;
+        await secondTurnGate;
+      }
+    },
+    beforeSettled: async () => {
+      settleCount++;
+      if (settleCount === 1) {
+        firstNativeSettled = true;
+        await firstSettleGate;
+      }
+    },
+  });
+  const backend: SubagentBackend = {
+    ...base,
+    capabilities: { ...base.capabilities, resumeFromSessionId: true },
+  };
+
+  const runtime = createRuntimeWithBackends([backend]);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("First turn")),
+    );
+    await runTool(runtime, manager.send(snap.id, "Queued second turn"));
+    while (!firstNativeSettled) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    releaseFirstSettle();
+    while (
+      !secondTurnWaiting ||
+      !manager.view.get(snap.id)?.finalText.includes("First turn")
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(manager.view.get(snap.id)?.status, "running");
+
+    const report = await runTool(runtime, manager.cancel([snap.id]));
+    assert.equal(report[0]?.cancelled, true);
+    assert.equal(manager.view.get(snap.id)?.status, "error");
+    assert.equal(manager.view.get(snap.id)?.errorText, "Run was aborted");
+    assert.equal(manager.view.get(snap.id)?.finalText, "");
+  } finally {
+    releaseFirstSettle();
+    releaseSecondTurn();
+    await runtime.dispose();
+  }
+});
+
+test("a send accepted in the native settlement gap survives hibernation", async () => {
+  let nativeSettled = false;
+  let secondTurnWaiting = false;
+  let secondNativeSettled = false;
+  let releaseFirstSettle = () => {};
+  let releaseSecondTurn = () => {};
+  let releaseSecondSettle = () => {};
+  const firstSettleGate = new Promise<void>((resolve) => {
+    releaseFirstSettle = resolve;
+  });
+  const secondTurnGate = new Promise<void>((resolve) => {
+    releaseSecondTurn = resolve;
+  });
+  const secondSettleGate = new Promise<void>((resolve) => {
+    releaseSecondSettle = resolve;
+  });
+  let settleCount = 0;
+  const base = makeStubBackend({
+    backend: "claude",
+    defaultModelLabel: "claude/sonnet",
+    contextWindow: 200_000,
+    toolName: "Bash",
+    cadenceMs: 1,
+    beforeTurn: async (turn) => {
+      if (turn === 1) {
+        secondTurnWaiting = true;
+        await secondTurnGate;
+      }
+    },
+    beforeSettled: async () => {
+      settleCount++;
+      if (settleCount === 1) {
+        nativeSettled = true;
+        await firstSettleGate;
+      } else if (settleCount === 2) {
+        secondNativeSettled = true;
+        await secondSettleGate;
+      }
+    },
+  });
+  let closedSessions = 0;
+  const backend: SubagentBackend = {
+    ...base,
+    capabilities: { ...base.capabilities, resumeFromSessionId: true },
+    spawn: (spawnTask) =>
+      Effect.gen(function* () {
+        const session = yield* base.spawn(spawnTask);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            closedSessions++;
+          }),
+        );
+        return session;
+      }),
+  };
+
+  const runtime = createRuntimeWithBackends([backend]);
+  try {
+    const manager = await runtime.runPromise(SubagentManager);
+    const snap = await runTool(
+      runtime,
+      manager.spawn("claude", task("First turn")),
+    );
+    while (!nativeSettled) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(manager.view.get(snap.id)?.status, "running");
+
+    await runTool(runtime, manager.send(snap.id, "Settlement-gap turn"));
+    let waitFinished = false;
+    const waiting = runTool(runtime, manager.waitFor([snap.id])).then(() => {
+      waitFinished = true;
+    });
+    releaseFirstSettle();
+    while (
+      !secondTurnWaiting ||
+      !manager.view.get(snap.id)?.finalText.includes("First turn")
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(manager.view.get(snap.id)?.status, "running");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(waitFinished, false);
+    releaseSecondTurn();
+    while (!secondNativeSettled) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(waitFinished, false);
+    releaseSecondSettle();
+    await waiting;
+
+    const settleDeadline = Date.now() + 5_000;
+    while (
+      !manager.view.get(snap.id)?.finalText.includes("Settlement-gap turn") &&
+      Date.now() < settleDeadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.match(
+      manager.view.get(snap.id)?.finalText ?? "",
+      /Settlement-gap turn/,
+    );
+    while (closedSessions < 1 && Date.now() < settleDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(closedSessions, 1);
+    assert.equal(manager.view.get(snap.id)?.status, "done");
+  } finally {
+    releaseFirstSettle();
+    releaseSecondTurn();
+    releaseSecondSettle();
+    await runtime.dispose();
+  }
 });

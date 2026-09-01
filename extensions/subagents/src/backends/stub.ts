@@ -16,6 +16,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Usage } from "@earendil-works/pi-ai";
 import type { Cause, Scope } from "effect";
 import { Duration, Effect, Fiber, Queue, Ref, Stream } from "effect";
 import type { SubagentBackend, SubagentSession } from "../backend.ts";
@@ -35,6 +36,12 @@ export interface StubProfile {
   readonly toolName: string;
   /** Delay between scripted events; varies per backend so streams differ. */
   readonly cadenceMs: number;
+  /** Optional cumulative billing payload for manager accounting tests. */
+  readonly billingUsage?: Usage;
+  /** Test-only boundary hook before a numbered turn emits RunStarted. */
+  readonly beforeTurn?: (turn: number) => Promise<void>;
+  /** Test-only boundary hook after native settle and before RunSettled emits. */
+  readonly beforeSettled?: () => Promise<void>;
 }
 
 const STUB_DIR = path.join(os.tmpdir(), "subagents-stub");
@@ -47,6 +54,7 @@ export function makeStubBackend(profile: StubProfile): SubagentBackend {
       steering: true,
       modelSelection: true,
       reasoningEffort: true,
+      resumeFromSessionId: false,
     },
     // Real impls probe binary-on-PATH / SDK import / credentials here.
     available: Effect.succeed(true),
@@ -75,7 +83,9 @@ const makeStubSession = (
   task: SpawnTask,
 ): Effect.Effect<SubagentSession, never, Scope.Scope> =>
   Effect.gen(function* () {
-    const sessionId = `stub-${profile.backend}-${++sessionCounter}`;
+    const sessionId =
+      task.resumeNativeSessionId ??
+      `stub-${profile.backend}-${++sessionCounter}`;
     const sessionFile = path.join(STUB_DIR, `${sessionId}.jsonl`);
 
     const state = {
@@ -89,6 +99,8 @@ const makeStubSession = (
       pending: [] as string[],
       turnCount: 0,
       closed: false,
+      accepting: true,
+      activeRun: false,
       /** True between the driver dequeuing a prompt and registering its turn fiber. */
       dispatching: false,
     };
@@ -116,6 +128,10 @@ const makeStubSession = (
 
     const runTurn = (userText: string, turn: number) =>
       Effect.gen(function* () {
+        if (profile.beforeTurn) {
+          yield* Effect.promise(() => profile.beforeTurn!(turn));
+        }
+        state.activeRun = true;
         yield* emit({ _tag: "RunStarted" });
         const failing = userText.trimStart().startsWith("FAIL:");
 
@@ -162,10 +178,15 @@ const makeStubSession = (
           _tag: "UsageChanged",
           tokens: Math.min(profile.contextWindow, 2400 * (turn + 1)),
           contextWindow: profile.contextWindow,
+          billing: profile.billingUsage,
         });
 
         if (failing) {
           yield* pause;
+          state.activeRun = false;
+          if (profile.beforeSettled) {
+            yield* Effect.promise(profile.beforeSettled);
+          }
           yield* emit({
             _tag: "RunSettled",
             outcome: {
@@ -192,7 +213,12 @@ const makeStubSession = (
           _tag: "UsageChanged",
           tokens: Math.min(profile.contextWindow, 2400 * (turn + 1) + 900),
           contextWindow: profile.contextWindow,
+          billing: profile.billingUsage,
         });
+        state.activeRun = false;
+        if (profile.beforeSettled) {
+          yield* Effect.promise(profile.beforeSettled);
+        }
         yield* emit({
           _tag: "RunSettled",
           outcome: { _tag: "Completed", finalText },
@@ -215,10 +241,17 @@ const makeStubSession = (
         const fiber = yield* Effect.forkChild(
           runTurn(text, turn).pipe(
             Effect.onInterrupt(() =>
-              emit({
-                _tag: "RunSettled",
-                outcome: { _tag: "Interrupted" },
-              }).pipe(Effect.ignore),
+              Effect.sync(() => {
+                state.activeRun = false;
+              }).pipe(
+                Effect.andThen(
+                  emit({
+                    _tag: "RunSettled",
+                    outcome: { _tag: "Interrupted" },
+                  }),
+                ),
+                Effect.ignore,
+              ),
             ),
           ),
         );
@@ -230,23 +263,25 @@ const makeStubSession = (
     });
     yield* Effect.forkScoped(driver.pipe(Effect.ignore));
 
-    yield* Effect.addFinalizer(() =>
-      Effect.gen(function* () {
-        state.closed = true;
-        yield* Queue.end(inbox).pipe(Effect.ignore);
-        yield* Queue.end(events).pipe(Effect.ignore);
-      }),
-    );
+    const shutdown = Effect.gen(function* () {
+      state.accepting = false;
+      state.closed = true;
+      yield* Queue.end(inbox).pipe(Effect.ignore);
+      yield* Queue.end(events).pipe(Effect.ignore);
+      return true;
+    });
+    yield* Effect.addFinalizer(() => shutdown.pipe(Effect.asVoid));
 
     const submit = (text: string) =>
       Effect.gen(function* () {
-        if (state.closed) {
+        if (state.closed || !state.accepting) {
           return yield* new SendError({
             message: "Subagent session is closed.",
           });
         }
         state.pending.push(text);
-        const busy = (yield* Ref.get(activeTurn)) !== undefined;
+        const busy = state.activeRun;
+        if (!busy) state.activeRun = true;
         if (busy) {
           // Show the queued steer line until the driver picks it up.
           yield* emit({ _tag: "QueueChanged", queued: queuedView() });
@@ -266,6 +301,13 @@ const makeStubSession = (
       meta: Effect.sync(() => state.meta),
       events: Stream.fromQueue(events),
       send: submit,
+      prepareHibernate: () => {
+        if (state.closed || !state.accepting) return "closed";
+        if (state.activeRun || state.pending.length > 0) return "busy";
+        state.accepting = false;
+        return "ready";
+      },
+      shutdown,
       interrupt: Effect.gen(function* () {
         // Drop queued prompts so interrupting cannot immediately start
         // another turn, then stop the active turn. A prompt may be mid-flight
@@ -286,6 +328,7 @@ const makeStubSession = (
             // No turn ever started. If we cancelled queued prompts, the run
             // still needs a terminal event or it would look running forever.
             if (cleared.length > 0) {
+              state.activeRun = false;
               yield* emit({
                 _tag: "RunSettled",
                 outcome: { _tag: "Interrupted" },

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import test from "node:test";
 import { Effect } from "effect";
 import { SubagentManager } from "./src/manager.ts";
@@ -26,6 +27,30 @@ async function claudeAvailable() {
   return Effect.runPromise(claudeBackend.available);
 }
 
+function directClaudeChildren(): number[] {
+  if (process.platform === "win32") return [];
+  return execFileSync("ps", ["-eo", "pid=,ppid=,args="], {
+    encoding: "utf8",
+  })
+    .split("\n")
+    .flatMap((line) => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      return Number(match?.[2]) === process.pid &&
+        match?.[3].includes("claude") &&
+        match[3].includes("--output-format stream-json")
+        ? [Number(match[1])]
+        : [];
+    });
+}
+
+async function waitForClaudeChildrenAtMost(count: number, timeoutMs: number) {
+  const end = Date.now() + timeoutMs;
+  while (directClaudeChildren().length > count && Date.now() < end) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(directClaudeChildren().length, count);
+}
+
 /** Rejecting deadline so a hung wait still reaches finally() and disposes. */
 function deadline<A>(operation: Promise<A>, timeoutMs: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -41,8 +66,8 @@ function deadline<A>(operation: Promise<A>, timeoutMs: number) {
 }
 
 test(
-  "Claude backend completes a live manager run",
-  { timeout: 60_000 },
+  "Claude backend hibernates after completion and resumes the same session",
+  { timeout: 120_000 },
   async (t) => {
     if (!(await claudeAvailable())) {
       t.skip("Claude Code executable is unavailable");
@@ -50,19 +75,59 @@ test(
     }
 
     const runtime = createSubagentRuntime();
+    const baselineChildPids = directClaudeChildren();
+    const baselineChildren = baselineChildPids.length;
     try {
       const manager = await runtime.runPromise(SubagentManager);
       const started = await runTool(
         runtime,
         manager.spawn("claude", task("Reply with exactly: hello claude")),
       );
+      const processDeadline = Date.now() + 10_000;
+      let firstChild: number | undefined;
+      if (process.platform !== "win32") {
+        firstChild = directClaudeChildren().find(
+          (pid) => !baselineChildPids.includes(pid),
+        );
+        while (firstChild === undefined && Date.now() < processDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          firstChild = directClaudeChildren().find(
+            (pid) => !baselineChildPids.includes(pid),
+          );
+        }
+        assert.ok(firstChild);
+      }
       await deadline(runTool(runtime, manager.waitFor([started.id])), 45_000);
 
-      const done = manager.view.get(started.id);
-      assert.equal(done?.status, "done");
-      assert.match(done?.finalText ?? "", /hello claude/i);
-      assert.ok(done?.meta.nativeSessionId);
-      assert.ok(done?.meta.sessionFilePath?.endsWith(".jsonl"));
+      const first = manager.view.get(started.id);
+      assert.equal(first?.status, "done");
+      assert.match(first?.finalText ?? "", /hello claude/i);
+      assert.ok(first?.meta.nativeSessionId);
+      assert.ok(first?.meta.sessionFilePath?.endsWith(".jsonl"));
+      const nativeSessionId = first.meta.nativeSessionId;
+
+      await runTool(
+        runtime,
+        manager.send(started.id, "Reply with exactly: resumed claude"),
+      );
+      if (firstChild !== undefined) {
+        assert.equal(directClaudeChildren().includes(firstChild), false);
+      }
+      const restartDeadline = Date.now() + 10_000;
+      while (
+        manager.view.get(started.id)?.status !== "running" &&
+        Date.now() < restartDeadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(manager.view.get(started.id)?.status, "running");
+      await deadline(runTool(runtime, manager.waitFor([started.id])), 45_000);
+
+      const resumed = manager.view.get(started.id);
+      assert.equal(resumed?.status, "done");
+      assert.match(resumed?.finalText ?? "", /resumed claude/i);
+      assert.equal(resumed?.meta.nativeSessionId, nativeSessionId);
+      await waitForClaudeChildrenAtMost(baselineChildren, 10_000);
     } finally {
       await runtime.dispose();
     }

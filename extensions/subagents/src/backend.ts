@@ -24,6 +24,8 @@ export interface BackendCapabilities {
   readonly steering: boolean;
   readonly modelSelection: boolean;
   readonly reasoningEffort: boolean;
+  /** A settled session can release its process and later resume from nativeSessionId. */
+  readonly resumeFromSessionId: boolean;
 }
 
 /**
@@ -43,6 +45,16 @@ export interface SubagentSession {
    * semantics — the "is a run active" decision is backend-native state).
    */
   send(text: string): Effect.Effect<void, SendError>;
+  /**
+   * Atomically stop accepting new turns if the native session is idle. The
+   * manager calls this at settlement before releasing a recoverable process.
+   */
+  prepareHibernate?(): "ready" | "busy" | "closed";
+  /**
+   * Stop the native process and confirm its event pump exited. Recoverable
+   * backends use this before their owning scope is closed.
+   */
+  readonly shutdown?: Effect.Effect<boolean>;
   /**
    * Interrupt the active run. Resolves once the backend acknowledges; the
    * corresponding RunSettled(Interrupted) arrives on `events`. Callers bound
