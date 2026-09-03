@@ -63,6 +63,10 @@ export interface SpawnTask {
   readonly model?: string;
   /** Shared effort scale; each backend maps it to its native equivalent. */
   readonly reasoningEffort?: ReasoningEffort;
+  /** Internal backend recovery key. Tool callers never set this directly. */
+  readonly resumeNativeSessionId?: string;
+  /** Usage retained while a recoverable backend process is hibernated. */
+  readonly priorBillingUsage?: Usage;
   readonly parent: ParentContext;
 }
 

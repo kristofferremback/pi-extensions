@@ -78,15 +78,27 @@ interface MutableSnapshot {
 
 interface Entry {
   snapshot: MutableSnapshot;
-  session: SubagentSession;
-  scope: Scope.Closeable;
+  task: SpawnTask;
+  /** Undefined while a recoverable settled session is hibernated. */
+  session?: SubagentSession;
+  scope?: Scope.Closeable;
   pump?: Fiber.Fiber<void>;
+  /** Scope shutdown that must succeed before this native transcript is resumed. */
+  hibernation?: Fiber.Fiber<boolean>;
+  /** Permanent refusal after native shutdown could not be confirmed. */
+  unresumableReason?: string;
+  /** Complete in-flight recovery, owned so cancel/disposal can interrupt it. */
+  restartFiber?: Fiber.Fiber<unknown, unknown>;
+  /** Distinguishes a resumed pump from late finalization of its predecessor. */
+  sessionGeneration: number;
   liveToolMap: Map<string, LiveToolState>;
   /** False for blocking run tools that collect their own result. */
   automaticDelivery: boolean;
   /** Idle restart dispatched but RunStarted not folded yet; counts as running
    * so concurrent restarts cannot race past the cap. */
   restarting?: boolean;
+  /** Native late steer accepted, but its next RunStarted has not arrived yet. */
+  queuedTurnPending?: boolean;
 }
 
 // --- Read model ----------------------------------------------------------------
@@ -216,10 +228,10 @@ const makeManager = Effect.gen(function* () {
     });
   });
 
-  const runningCount = () =>
-    [...entries.values()].filter(
-      (e) => e.snapshot.status === "running" || e.restarting === true,
-    ).length;
+  const isActive = (entry: Entry) =>
+    entry.snapshot.status === "running" || entry.restarting === true;
+
+  const runningCount = () => [...entries.values()].filter(isActive).length;
 
   const addInterest = (ids: ReadonlyArray<string>) => {
     for (const id of ids) waitInterest.set(id, (waitInterest.get(id) ?? 0) + 1);
@@ -232,15 +244,66 @@ const makeManager = Effect.gen(function* () {
     }
   };
 
+  const closeScope = (scope: Scope.Closeable) =>
+    Scope.close(scope, Exit.void).pipe(Effect.ignore);
+
   const closeEntryScope = (entry: Entry) =>
-    Scope.close(entry.scope, Exit.void).pipe(Effect.ignore);
+    entry.scope ? closeScope(entry.scope) : Effect.void;
+
+  const trackCleanup = <A>(effect: Effect.Effect<A>) => {
+    const fiber = runDetached(effect);
+    cleanups.add(fiber);
+    fiber.addObserver(() => cleanups.delete(fiber));
+    return fiber;
+  };
+
+  const hibernateEntry = (entry: Entry) => {
+    const backend = registry.get(entry.snapshot.backend);
+    const session = entry.session;
+    if (
+      !backend?.capabilities.resumeFromSessionId ||
+      !entry.snapshot.meta.nativeSessionId ||
+      !entry.scope ||
+      !session?.shutdown ||
+      !session.prepareHibernate
+    ) {
+      return;
+    }
+
+    const readiness = session.prepareHibernate();
+    if (readiness === "busy") {
+      // The native backend accepted a turn after its prior result but before
+      // the manager folded that settlement. Reserve the slot until RunStarted.
+      entry.restarting = true;
+      entry.queuedTurnPending = true;
+      return;
+    }
+
+    const scope = entry.scope;
+    entry.session = undefined;
+    entry.scope = undefined;
+    entry.pump = undefined;
+    entry.hibernation = trackCleanup(
+      session.shutdown.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            // Native shutdown owns the process deadline. Scope cleanup may
+            // contain unrelated finalizers, so never interrupt it halfway.
+            trackCleanup(closeScope(scope));
+          }),
+        ),
+      ),
+    );
+  };
 
   const pruneSettled = () => {
     if (entries.size <= MAX_TRACKED) return;
     const candidates = [...entries.values()]
       .filter(
         (e) =>
-          e.snapshot.status !== "running" && !waitInterest.has(e.snapshot.id),
+          e.snapshot.status !== "running" &&
+          !e.restarting &&
+          !waitInterest.has(e.snapshot.id),
       )
       .sort(
         (a, b) =>
@@ -250,15 +313,14 @@ const makeManager = Effect.gen(function* () {
     for (const entry of candidates) {
       if (entries.size <= MAX_TRACKED) break;
       entries.delete(entry.snapshot.id);
-      const fiber = runDetached(closeEntryScope(entry));
-      cleanups.add(fiber);
-      fiber.addObserver(() => cleanups.delete(fiber));
+      trackCleanup(closeEntryScope(entry));
     }
   };
 
   const settle = (entry: Entry, outcome: RunOutcome) => {
     const s = entry.snapshot;
     entry.restarting = false;
+    entry.queuedTurnPending = false;
     if (s.status !== "running") return;
     s.settledAt = Date.now();
     switch (outcome._tag) {
@@ -282,19 +344,32 @@ const makeManager = Effect.gen(function* () {
     s.liveAssistant = undefined;
     entry.liveToolMap.clear();
     s.liveTools = [];
-    s.queued = [];
+    const hasQueuedTurn = s.queued.length > 0;
+    entry.restarting = hasQueuedTurn;
+    entry.queuedTurnPending = hasQueuedTurn;
+    if (!hasQueuedTurn) s.queued = [];
+    // A late steer belongs to this native streaming-input session. Its next
+    // RunStarted follows the current settlement, so closing here would drop it.
+    // Reserve hidden native restarts before waking manager waiters.
+    if (!hasQueuedTurn) hibernateEntry(entry);
     const consumed =
       !entry.automaticDelivery || (waitInterest.get(s.id) ?? 0) > 0;
     // Manual collection applies only to the initial blocking run. If the user
     // later restarts this child through takeover, that settlement is pushed.
     entry.automaticDelivery = true;
-    notify(s.id);
     try {
-      // During teardown, don't queue results into a shutting-down session.
+      // The hook snapshots this completed run before a queued successor flips
+      // the public status back to running.
       if (!disposed) onSettled?.(s, consumed);
     } catch {
       // The parent session may be unavailable; settlement stays final.
     }
+    if (entry.restarting) {
+      s.status = "running";
+      s.settledAt = undefined;
+      s.errorText = undefined;
+    }
+    notify(s.id);
     pruneSettled();
   };
 
@@ -303,6 +378,7 @@ const makeManager = Effect.gen(function* () {
     switch (event._tag) {
       case "RunStarted":
         entry.restarting = false;
+        entry.queuedTurnPending = false;
         s.status = "running";
         s.settledAt = undefined;
         s.errorText = undefined;
@@ -376,6 +452,44 @@ const makeManager = Effect.gen(function* () {
     notify(s.id);
   };
 
+  const attachSession = (
+    entry: Entry,
+    session: SubagentSession,
+    scope: Scope.Closeable,
+  ) =>
+    Effect.gen(function* () {
+      entry.session = session;
+      entry.scope = scope;
+      const generation = ++entry.sessionGeneration;
+      const pump = Stream.runForEach(session.events, (event) =>
+        Effect.sync(() => foldEvent(entry, event)),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (entry.sessionGeneration !== generation) return;
+            const queuedTurnFailed = entry.queuedTurnPending === true;
+            if (queuedTurnFailed) {
+              // The backend ended after settling one turn but before starting
+              // its queued successor. Turn that stranded reservation into an
+              // honest failed run and release the recoverable session.
+              entry.snapshot.queued = [];
+              entry.snapshot.status = "running";
+            }
+            if (
+              queuedTurnFailed ||
+              (entry.snapshot.status === "running" && entry.session !== undefined)
+            ) {
+              settle(entry, {
+                _tag: "Failed",
+                errorText: "Backend event stream ended unexpectedly",
+              });
+            }
+          }),
+        ),
+      );
+      entry.pump = yield* Scope.provide(Effect.forkScoped(pump), scope);
+    });
+
   const spawn = (backendName: BackendName, task: SpawnTask) =>
     Effect.gen(function* () {
       // Reserve synchronously (before the first yield inside doSpawn) so
@@ -444,31 +558,13 @@ const makeManager = Effect.gen(function* () {
             finalText: "",
             turns: 0,
           },
-          session,
-          scope,
+          task,
+          sessionGeneration: 0,
           liveToolMap: new Map(),
           automaticDelivery: task.delivery !== "manual",
         };
         entries.set(id, entry);
-
-        // Pump: fold the event stream into the snapshot. Tied to the entry
-        // scope, so closing the scope stops it. If the stream ends while the
-        // subagent still looks running, the backend died out from under us.
-        const pump = Stream.runForEach(session.events, (event) =>
-          Effect.sync(() => foldEvent(entry, event)),
-        ).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              if (entry.snapshot.status === "running") {
-                settle(entry, {
-                  _tag: "Failed",
-                  errorText: "Backend event stream ended unexpectedly",
-                });
-              }
-            }),
-          ),
-        );
-        entry.pump = yield* Scope.provide(Effect.forkScoped(pump), scope);
+        yield* attachSession(entry, session, scope);
 
         notify(id);
         return entry.snapshot as SubagentSnapshot;
@@ -493,9 +589,10 @@ const makeManager = Effect.gen(function* () {
       addInterest(unique);
       const loop = Effect.gen(function* () {
         while (true) {
-          const pending = unique.filter(
-            (id) => entries.get(id)?.snapshot.status === "running",
-          );
+          const pending = unique.filter((id) => {
+            const entry = entries.get(id);
+            return entry ? isActive(entry) : false;
+          });
           if (pending.length === 0) return;
           onPending?.(pending);
           yield* nextChange;
@@ -517,24 +614,27 @@ const makeManager = Effect.gen(function* () {
   ) =>
     Effect.suspend(() => {
       const unique = [...new Set(ids)];
-      const initiallySettled = unique.filter(
-        (id) => entries.get(id)?.snapshot.status !== "running",
-      );
+      const initiallySettled = unique.filter((id) => {
+        const entry = entries.get(id);
+        return !entry || !isActive(entry);
+      });
       if (initiallySettled.length > 0) {
         return Effect.succeed({
           settled: initiallySettled,
-          pending: unique.filter(
-            (id) => entries.get(id)?.snapshot.status === "running",
-          ),
+          pending: unique.filter((id) => {
+            const entry = entries.get(id);
+            return entry ? isActive(entry) : false;
+          }),
         });
       }
 
       addInterest(unique);
       const loop = Effect.gen(function* () {
         while (true) {
-          const pending = unique.filter(
-            (id) => entries.get(id)?.snapshot.status === "running",
-          );
+          const pending = unique.filter((id) => {
+            const entry = entries.get(id);
+            return entry ? isActive(entry) : false;
+          });
           const settled = unique.filter((id) => !pending.includes(id));
           if (settled.length > 0) return { settled, pending };
           onPending?.(pending);
@@ -554,7 +654,19 @@ const makeManager = Effect.gen(function* () {
   /** Interrupt one running entry, force-closing its scope after 5s. */
   const abortEntry = (entry: Entry) =>
     Effect.gen(function* () {
-      if (entry.snapshot.status !== "running") return;
+      if (!isActive(entry)) return;
+      if (!entry.session) {
+        if (entry.restartFiber) {
+          yield* Fiber.interrupt(entry.restartFiber).pipe(Effect.ignore);
+        }
+        entry.snapshot.status = "running";
+        yield* Effect.sync(() => settle(entry, { _tag: "Interrupted" }));
+        return;
+      }
+      if (entry.snapshot.status !== "running") {
+        entry.snapshot.status = "running";
+        notify(entry.snapshot.id);
+      }
       const graceful = yield* entry.session.interrupt.pipe(
         Effect.timeout(STOP_TIMEOUT_MS),
         Effect.result,
@@ -583,9 +695,7 @@ const makeManager = Effect.gen(function* () {
       const unique = [...new Set(ids)];
       const running = unique
         .map((id) => entries.get(id))
-        .filter(
-          (entry): entry is Entry => entry?.snapshot.status === "running",
-        );
+        .filter((entry): entry is Entry => Boolean(entry && isActive(entry)));
       const runningIds = running.map((entry) => entry.snapshot.id);
       // Mark consumed before interrupting so cancellation does not also
       // enqueue duplicate automatic result messages into the parent.
@@ -594,7 +704,7 @@ const makeManager = Effect.gen(function* () {
         yield* Effect.forEach(running, abortEntry, {
           concurrency: "unbounded",
         });
-        while (running.some((entry) => entry.snapshot.status === "running")) {
+        while (running.some(isActive)) {
           yield* nextChange;
         }
       });
@@ -619,6 +729,69 @@ const makeManager = Effect.gen(function* () {
       );
     });
 
+  const resumeEntry = (entry: Entry, text: string) =>
+    Effect.gen(function* () {
+      const backend = registry.get(entry.snapshot.backend);
+      const nativeSessionId = entry.snapshot.meta.nativeSessionId;
+      if (entry.unresumableReason) {
+        return yield* new SendError({ message: entry.unresumableReason });
+      }
+      if (!backend?.capabilities.resumeFromSessionId || !nativeSessionId) {
+        return yield* new SendError({
+          message: `Subagent "${entry.snapshot.id}" cannot resume because its backend session is no longer live.`,
+        });
+      }
+
+      if (entry.hibernation) {
+        const stopped = yield* Fiber.join(entry.hibernation);
+        entry.hibernation = undefined;
+        if (!stopped) {
+          entry.unresumableReason = `Subagent "${entry.snapshot.id}" did not shut down cleanly; refusing to resume the same native session.`;
+          return yield* new SendError({ message: entry.unresumableReason });
+        }
+      }
+      if (disposed || entries.get(entry.snapshot.id) !== entry) {
+        return yield* new SendError({
+          message: `Subagent "${entry.snapshot.id}" is no longer tracked.`,
+        });
+      }
+
+      const scope = yield* Scope.make();
+      // Publish ownership before acquisition yields. Disposal can now close the
+      // scope and interrupt the acquisition instead of losing an untracked child.
+      entry.scope = scope;
+      const spawnFiber = yield* Effect.forkChild(
+        Scope.provide(
+          backend.spawn({
+            ...entry.task,
+            prompt: text,
+            resumeNativeSessionId: nativeSessionId,
+            priorBillingUsage: entry.snapshot.usage.billing,
+          }),
+          scope,
+        ).pipe(
+          Effect.mapError(
+            (error) => new SendError({ message: bounded(error.message) }),
+          ),
+          Effect.onError(() => closeScope(scope)),
+        ),
+      );
+      const session = yield* Fiber.join(spawnFiber).pipe(
+        Effect.onError(() =>
+          Effect.sync(() => {
+            if (entry.scope === scope) entry.scope = undefined;
+          }),
+        ),
+      );
+      if (disposed || entries.get(entry.snapshot.id) !== entry) {
+        yield* closeScope(scope);
+        return yield* new SendError({
+          message: "Subagent manager shut down while resuming the session.",
+        });
+      }
+      yield* attachSession(entry, session, scope);
+    });
+
   const send = (id: string, text: string) =>
     Effect.suspend((): Effect.Effect<void, SendError> => {
       const entry = entries.get(id);
@@ -631,25 +804,62 @@ const makeManager = Effect.gen(function* () {
       // must respect the same cap as spawn. Steering an already-running one
       // does not consume additional capacity.
       if (entry.snapshot.status !== "running") {
+        if (entry.restarting) {
+          return new SendError({
+            message: `Subagent "${id}" is already restarting.`,
+          });
+        }
         if (runningCount() + reserved >= MAX_RUNNING) {
           return new SendError({
             message: `Max ${MAX_RUNNING} subagents can run concurrently; restarting "${id}" would exceed that.`,
           });
         }
-        // Occupy the slot synchronously: the RunStarted that flips status
-        // arrives via the async pump, and two concurrent restarts must not
-        // both pass the check in that window. Cleared by RunStarted/settle,
-        // or here when the backend rejects the send.
+        // Occupy the slot and publish active status synchronously. RunStarted
+        // confirms it; a failed restart restores this terminal snapshot.
+        const prior = {
+          status: entry.snapshot.status,
+          settledAt: entry.snapshot.settledAt,
+          errorText: entry.snapshot.errorText,
+        };
         entry.restarting = true;
-        return entry.session.send(text).pipe(
+        entry.snapshot.status = "running";
+        entry.snapshot.settledAt = undefined;
+        entry.snapshot.errorText = undefined;
+        notify(entry.snapshot.id);
+        const restart = entry.session
+          ? entry.session.send(text)
+          : Effect.gen(function* () {
+              const fiber = yield* Effect.forkChild(resumeEntry(entry, text));
+              entry.restartFiber = fiber;
+              return yield* Fiber.join(fiber).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    if (entry.restartFiber === fiber) {
+                      entry.restartFiber = undefined;
+                    }
+                  }),
+                ),
+              );
+            });
+        return restart.pipe(
           Effect.onError(() =>
             Effect.sync(() => {
-              entry.restarting = false;
+              if (entry.restarting) {
+                entry.restarting = false;
+                entry.snapshot.status = prior.status;
+                entry.snapshot.settledAt = prior.settledAt;
+                entry.snapshot.errorText = prior.errorText;
+              }
+              notify(entry.snapshot.id);
             }),
           ),
         );
       }
-      return entry.session.send(text);
+      return entry.session
+        ? entry.session.send(text)
+        : new SendError({
+            message: `Subagent "${id}" has no live backend session.`,
+          });
     });
 
   const disposeAll = Effect.gen(function* () {
@@ -659,14 +869,22 @@ const makeManager = Effect.gen(function* () {
     yield* Effect.forEach(
       all,
       (entry) =>
+        entry.restartFiber
+          ? Fiber.interrupt(entry.restartFiber).pipe(Effect.ignore)
+          : Effect.void,
+      { concurrency: "unbounded" },
+    );
+    yield* Effect.forEach(
+      all,
+      (entry) =>
         closeEntryScope(entry).pipe(
           Effect.timeout(STOP_TIMEOUT_MS),
           Effect.ignore,
         ),
       { concurrency: "unbounded" },
     );
-    // Pruning cleanups are detached; bound them like everything else so a
-    // stuck backend finalizer cannot block runtime shutdown indefinitely.
+    // Hibernation and pruning cleanups are detached; bound them like everything
+    // else so a stuck backend finalizer cannot block runtime shutdown.
     yield* Effect.forEach(
       [...cleanups],
       (fiber) =>

@@ -9,6 +9,7 @@
  * and the normalized view consumed by the manager.
  */
 
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -38,6 +39,7 @@ import { SendError, SpawnError } from "../domain.ts";
 
 const CLAUDE_CONTEXT_WINDOW = 200_000;
 const INTERRUPT_TIMEOUT_MS = 2_000;
+const PROCESS_EXIT_TIMEOUT_MS = 8_000;
 const PREVIEW_MAX_LENGTH = 4_096;
 
 // --- Binary resolution --------------------------------------------------------
@@ -289,13 +291,13 @@ export function claudeResultUsage(result: SDKResultMessage): Usage {
 
 function waitBounded(operation: Promise<unknown>, timeoutMs: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<void>((resolve) => {
-    timer = setTimeout(resolve, timeoutMs);
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
   });
   return Promise.race([
     operation.then(
-      () => undefined,
-      () => undefined,
+      () => true,
+      () => true,
     ),
     timeout,
   ]).finally(() => {
@@ -324,6 +326,7 @@ const makeClaudeSession = (
 
     const state = {
       closed: false,
+      accepting: true,
       activeRun: false,
       interruptRequested: false,
       runVersion: 0,
@@ -335,7 +338,9 @@ const makeClaudeSession = (
       liveText: "",
       tools: new Map<string, string>(),
       settleWaiters: new Set<() => void>(),
-      billingUsage: emptyUsage(),
+      billingUsage: task.priorBillingUsage
+        ? structuredClone(task.priorBillingUsage)
+        : emptyUsage(),
       meta: {
         backend: "claude",
         modelLabel: task.model,
@@ -349,6 +354,8 @@ const makeClaudeSession = (
       ? THINKING_BUDGETS[task.reasoningEffort]
       : undefined;
     const claudeBinary = resolveClaudeBinary();
+    let childExit: Promise<void> | undefined;
+    let nativeStderrTail = "";
     const nativeQuery = yield* Effect.try({
       try: () =>
         query({
@@ -367,9 +374,34 @@ const makeClaudeSession = (
               : { settingSources: ["user" as const] }),
             includePartialMessages: true,
             abortController,
+            ...(task.resumeNativeSessionId
+              ? { resume: task.resumeNativeSessionId }
+              : {}),
             ...(claudeBinary
               ? { pathToClaudeCodeExecutable: claudeBinary }
               : {}),
+            spawnClaudeCodeProcess: (options) => {
+              const child = spawn(options.command, options.args, {
+                cwd: options.cwd,
+                env: options.env,
+                signal: options.signal,
+                windowsHide: true,
+                stdio: ["pipe", "pipe", "pipe"],
+              });
+              child.stderr.setEncoding("utf8");
+              child.stderr.on("data", (chunk: string) => {
+                nativeStderrTail = (nativeStderrTail + chunk).slice(
+                  -PREVIEW_MAX_LENGTH,
+                );
+              });
+              childExit = new Promise<void>((resolve) => {
+                child.once("exit", () => resolve());
+                child.once("error", () => {
+                  if (child.pid === undefined) resolve();
+                });
+              });
+              return child;
+            },
             ...(task.model ? { model: task.model } : {}),
             ...(thinkingBudget !== undefined
               ? { maxThinkingTokens: thinkingBudget }
@@ -417,6 +449,8 @@ const makeClaudeSession = (
       state.runVersion++;
       state.currentText = "";
       state.liveText = "";
+      state.queued = [];
+      emit({ _tag: "QueueChanged", queued: [] });
       emit({ _tag: "RunStarted" });
     };
 
@@ -574,7 +608,10 @@ const makeClaudeSession = (
         for await (const message of nativeQuery) handleMessage(message);
       } catch (error) {
         if (!state.closed && !abortController.signal.aborted) {
-          failure = boundedError(error);
+          const stderr = nativeStderrTail.trim();
+          failure = boundedError(
+            stderr ? `${boundedError(error)}\n${stderr}` : error,
+          );
         }
       } finally {
         if (!state.closed) {
@@ -599,8 +636,10 @@ const makeClaudeSession = (
       }
     };
 
-    yield* Effect.addFinalizer(() =>
-      Effect.promise(async () => {
+    let shutdownPromise: Promise<boolean> | undefined;
+    const shutdown = () => {
+      shutdownPromise ??= (async () => {
+        state.accepting = false;
         // Settle before marking closed: the pump's finally skips settlement
         // once closed, and every run must end in a RunSettled even when the
         // scope closes mid-run.
@@ -611,14 +650,27 @@ const makeClaudeSession = (
         input.end();
         abortController.abort();
         nativeQuery.close();
-        await waitBounded(pumpDone, INTERRUPT_TIMEOUT_MS);
+        const pumpStopped = await waitBounded(
+          pumpDone,
+          INTERRUPT_TIMEOUT_MS,
+        );
+        const processStopped = childExit
+          ? await waitBounded(childExit, PROCESS_EXIT_TIMEOUT_MS)
+          : pumpStopped;
         Queue.endUnsafe(events);
-      }),
+        return pumpStopped && processStopped;
+      })();
+      return shutdownPromise;
+    };
+
+    yield* Effect.addFinalizer(() =>
+      Effect.promise(shutdown).pipe(Effect.asVoid),
     );
 
     void pump();
 
     const submit = (text: string) => {
+      if (!state.accepting) return false;
       const wasActive = state.activeRun;
       const message = input.push(text);
       if (!message) return false;
@@ -673,8 +725,32 @@ const makeClaudeSession = (
             ? Effect.void
             : new SendError({ message: "Subagent session is closed." });
         }),
+      prepareHibernate: () => {
+        if (state.closed || !state.accepting) return "closed";
+        if (state.activeRun || state.queued.length > 0) return "busy";
+        state.accepting = false;
+        return "ready";
+      },
+      shutdown: Effect.promise(shutdown),
       interrupt: Effect.promise(async () => {
-        if (state.closed || !state.activeRun) return;
+        if (state.closed) return;
+        if (!state.activeRun && state.queued.length > 0) {
+          // The prior turn settled, but a late steer is still queued natively.
+          // Make it a real interrupted run, then close so the CLI cannot start it.
+          state.activeRun = true;
+          state.runVersion++;
+          state.interruptRequested = true;
+          input.clear();
+          state.queued = [];
+          emit({ _tag: "QueueChanged", queued: [] });
+          settle({ _tag: "Interrupted" });
+          state.accepting = false;
+          input.end();
+          abortController.abort();
+          nativeQuery.close();
+          return;
+        }
+        if (!state.activeRun) return;
         const version = state.runVersion;
         state.interruptRequested = true;
         input.clear();
@@ -722,7 +798,12 @@ const makeClaudeSession = (
 
 export const claudeBackend: SubagentBackend = {
   name: "claude",
-  capabilities: { steering: true, modelSelection: true, reasoningEffort: true },
+  capabilities: {
+    steering: true,
+    modelSelection: true,
+    reasoningEffort: true,
+    resumeFromSessionId: true,
+  },
   available: Effect.sync(() => resolveClaudeBinary() !== undefined),
   spawn: makeClaudeSession,
 };
